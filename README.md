@@ -1,4 +1,4 @@
-# Multi-token-attention
+# Multi-Token-Attention
 Unofficial paper implementation of "Multi Token Attention" by Olga et al published by FAIR at Meta. 
 
 # Implementation Roadmap 
@@ -7,3 +7,6 @@ Unofficial paper implementation of "Multi Token Attention" by Olga et al publish
 - [ ] Evaluation on pretraining comparing with other attention mechanisms 
 - [ ] Evaluation on fine-tuning comparing with other attention mechanisms
 - [ ] MTA CUDA implementation with custom cuda kernel for convolution to accurately get causal mask for MTA.
+
+# What is MTA? 
+

@@ -1,0 +1,4 @@
+gpt2/
+data/
+__pycache__/
+run.sh
