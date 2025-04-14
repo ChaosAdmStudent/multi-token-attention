@@ -7,7 +7,7 @@ import torch.nn.functional as F
 class MultiTokenAttention(nn.Module): 
 
     def __init__(self, kernel_size:  Tuple[int,int, int], conv_option: Literal['pre','post','mix'],
-                 embed_dim ,kv_dim, context_length, num_heads, droprate=0.0):  
+                 embed_dim ,kv_dim, num_heads, max_batch_size, max_seq_len, droprate=0.0):  
         
         '''
         kernel_size: (c_q, c_k, c_h) kernel size for the query-key and head-mixing convolutions. 
@@ -21,20 +21,16 @@ class MultiTokenAttention(nn.Module):
         
         assert embed_dim % num_heads == 0, "embed_dim should be divisible by num_heads!"
 
-        self.W_q = nn.Linear(embed_dim, embed_dim) 
-        self.W_k = nn.Linear(kv_dim, embed_dim) 
-        self.W_v = nn.Linear(kv_dim, embed_dim)
+        self.W_query = nn.Linear(embed_dim, embed_dim) 
+        self.W_key = nn.Linear(kv_dim, embed_dim) 
+        self.W_value = nn.Linear(kv_dim, embed_dim)
 
-        self.register_buffer(
-            "mask",
-            torch.triu(torch.ones(context_length, context_length), diagonal=1) 
-        )
-
-        self.context_length = context_length
         self.kv_dim = kv_dim
         self.num_heads = num_heads 
         self.head_dim = embed_dim // num_heads
         self.embed_dim = embed_dim
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
 
         self.c_q = kernel_size[0] 
         self.c_k = kernel_size[1] 
@@ -74,7 +70,11 @@ class MultiTokenAttention(nn.Module):
         self.dropout = nn.Dropout(droprate) 
         self.proj_out = nn.Linear(embed_dim, embed_dim) 
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor: 
+        self.kv_cache_enabled = False  
+        self.register_buffer("cache_k", None) # Buffers for caches 
+        self.register_buffer("cache_v", None) 
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, start_pos: int = None, is_causal=True) -> torch.Tensor: 
         
         assert len(query.shape) == 3, "Query should have shape (B,N,embed_dim)" 
         assert len(key.shape) == 3, "Key should have shape (B,N,kv_dim)" 
@@ -82,19 +82,55 @@ class MultiTokenAttention(nn.Module):
         assert query.shape[-1] == self.embed_dim, f"Query should have embedding size {self.embed_dim}"
         assert key.shape[-1] == self.kv_dim, f"Key should have embedding size {self.kv_dim}"
         assert value.shape[-1] == self.kv_dim, f"Value should have embedding size {self.kv_dim}"
-        
+        if self.kv_cache_enabled: 
+            assert start_pos is not None, "Must provide start_pos argument if using kv-cache"
+
+        is_cross_att = key is not query
+
         B, N_q, _ = query.shape 
         _, N_kv, _ = key.shape 
 
         # Compute Q,K,V
-        query = self.W_q(query)  # (B,N_q,embed_dim) 
-        key = self.W_k(key)  # (B,N_kv, embed_dim) 
-        value = self.W_v(value) 
+        query = self.W_query(query)  # (B,N_q,embed_dim) 
+        
+        # Extract K and V from cache if cross attention
+        if is_cross_att and self.cache_k is not None: 
+            key = self.cache_k 
+            value = self.cache_v
+        
+        else: 
+            key = self.W_key(key)  # (B,N_kv, embed_dim) 
+            value = self.W_value(value) 
+
+        # Causal Mask 
+        if is_causal: 
+            mask = torch.triu(torch.ones(N_q, N_kv), diagonal=1).bool()
 
         # Split dimensions into heads 
         query = query.view(B, N_q, self.num_heads, self.head_dim).transpose(1,2) # (B,H, N_q, d_h) 
         key = key.view(B, N_kv, self.num_heads, self.head_dim).transpose(1,2) # (B,H, N_kv, d_h) 
         value = value.view(B, N_kv, self.num_heads, self.head_dim).transpose(1,2) # (B,H, N_kv, d_h) 
+        
+        if self.kv_cache_enabled: 
+            if is_cross_att: 
+                if self.cache_k is None: 
+                    # Initialize K-V once because it does not grow if encoder-decoder architecture 
+                    self.cache_k = key
+                    self.cache_v = value 
+
+            else: 
+                if self.cache_k is None: 
+                    # Initialize cache for keys and values 
+                    self.cache_k = torch.empty(self.max_batch_size, self.num_heads, self.max_seq_len, self.head_dim, device=query.device)
+                    self.cache_v = torch.empty_like(self.cache_k, device=query.device) 
+                
+                # Cache keys and values since it grows in self-attention
+                self.cache_k[:B, start_pos: start_pos + N_q] = key
+                self.cache_v[:B, start_pos: start_pos + N_q] = value
+
+                # Extract cached keys and values for computations 
+                key = self.cache_k[:B, :start_pos + N_q] # (B, N', num_heads, head_dim) 
+                value = self.cache_v[:B, :start_pos + N_q] 
 
         # Calculate attention scores 
         attention_scores = query @ key.transpose(2,3) # (B,H,N_q,N_kv) 
@@ -106,7 +142,7 @@ class MultiTokenAttention(nn.Module):
         if self.conv_option == 'pre':
 
             # Mask 1: Zeros above main diagonal 
-            attention_scores.masked_fill_(self.mask.bool()[:N_q, :N_kv], 0) 
+            attention_scores.masked_fill_(mask, 0) 
 
             # Add channel dimension for 3D conv 
             attention_scores = attention_scores.unsqueeze(2) # (B,H,1,N_q,N_kv) 
@@ -123,7 +159,7 @@ class MultiTokenAttention(nn.Module):
             out_conv = out_conv.squeeze(2) # (B,H,N_q,N_kv) 
 
             # Mask 2: -Inf above main diagonal so that softmax ignores contribution 
-            out_conv.masked_fill_(self.mask.bool()[:N_q, :N_kv], -torch.inf) 
+            out_conv.masked_fill_(mask, -torch.inf) 
             
             # Softmax 
             attention_weights = torch.softmax(out_conv, dim=-1) 
@@ -132,11 +168,11 @@ class MultiTokenAttention(nn.Module):
         elif self.conv_option == 'post': 
         
             # Mask 1: -Inf above main diagonal 
-            attention_scores.masked_fill_(self.mask.bool()[:N_q, :N_kv], -torch.inf) 
+            attention_scores.masked_fill_(mask, -torch.inf) 
             attention_weights = torch.softmax(attention_scores, dim=-1) 
 
             # Add channel dimension for 3D conv 
-            attention_scores = attention_scores.unsqueeze(2) # (B,H,1,N_q,N_kv) 
+            attention_weights = attention_weights.unsqueeze(2) # (B,H,1,N_q,N_kv) 
 
             # Asymmetric Padding 
             attention_weights = F.pad(attention_weights, (
@@ -150,14 +186,14 @@ class MultiTokenAttention(nn.Module):
             out_conv = out_conv.squeeze(2) # (B,H,N_q,N_kv) 
 
             # Mask 2: 0 above main diagonal so that future values are ignored 
-            out_conv.masked_fill_(self.mask.bool()[:N_q, :N_kv], 0) 
+            out_conv.masked_fill_(mask, 0) 
             attention_weights = out_conv 
         
         # Pre-softmax convolution on query-key and post-softmax on head mixing 
         elif self.conv_option == 'mix': 
             
             # Mask 1: Zeros above main diagonal 
-            attention_scores.masked_fill_(self.mask.bool()[:N_q, :N_kv], 0) 
+            attention_scores.masked_fill_(mask, 0) 
 
             # Asymmetric Padding 
             attention_scores = F.pad(attention_scores, (
@@ -169,6 +205,7 @@ class MultiTokenAttention(nn.Module):
             out_conv_qk = self.conv_qk(attention_scores) # (B, H, N_q, N_kv) 
             
             # Mask 2: -Inf above main diagnal before softmax 
+            out_conv_qk.masked_fill_(mask, -torch.inf)
             attention_weights = torch.softmax(out_conv_qk, dim=-1) 
             
             # Reshape for input to 1D conv 
@@ -179,13 +216,15 @@ class MultiTokenAttention(nn.Module):
             attention_weights = self.conv_heads(attention_weights) # (B*N_q*N_kv,H,1) 
 
             # Reshape back 
-            attention_weights = attention_weights.reshape(B,N_q, N_kv, self.num_heads, 1) # (B,N_q,N_kv,H) 
+            attention_weights = attention_weights.reshape(B,N_q, N_kv, self.num_heads) # (B,N_q,N_kv,H) 
             attention_weights = attention_weights.permute(0,3,1,2) # (B,H,N_q,N_kv) 
             
+        # Dropout on attention weights
+        attention_weights = self.dropout(attention_weights)
 
         # Calculate context vector 
         context_vector = attention_weights @ value # (B,H, N_q, d_h) 
-        context_vector = context_vector.transpose(1,2).view(B,N_q, self.embed_dim) 
+        context_vector = context_vector.transpose(1,2).contiguous().view(B,N_q, self.embed_dim) 
 
         # Feed Forward 
         context_vector = self.proj_out(context_vector) 
